@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post, put},  
     Json, Router,
 };
-
+use axum::extract::DefaultBodyLimit;
 use futures_util::TryStreamExt;
 use hmac::{Hmac, Mac};
 use mongodb::{
@@ -250,7 +250,12 @@ struct SupplierInvoiceDto {
     pub invoice_id: Option<String>,
     pub amount: f64,
     pub created_at: Option<String>,
+
+    // ✅ الجديد
+    pub note: Option<String>,
+    pub image_text: Option<String>, // DataURL أو Base64
 }
+
 
 /* ---- Table ---- */
 
@@ -299,7 +304,7 @@ async fn auth_mw(
         log_app(&format!("-> X-Signature present ({:.8}…)", sig));
 
         let owned: Body = std::mem::take(req.body_mut());
-        let bytes = to_bytes(owned, 1_048_576)
+let bytes = to_bytes(owned, 10 * 1024 * 1024)
             .await
             .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
 
@@ -2706,6 +2711,10 @@ struct SupplierInvoiceCreateReq {
     pub invoice_id: Option<String>,
     pub amount: f64,
     pub created_at: Option<String>,
+
+    // ✅ الجديد
+    pub note: Option<String>,
+    pub image_text: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2714,7 +2723,12 @@ struct SupplierInvoiceUpdateReq {
     pub invoice_id: Option<String>,
     pub amount: Option<f64>,
     pub created_at: Option<String>,
+
+    // ✅ الجديد
+    pub note: Option<String>,
+    pub image_text: Option<String>,
 }
+
 
 async fn supplier_invoices_list(
     Query(q): Query<SupplierInvoicesQuery>,
@@ -2739,20 +2753,18 @@ async fn supplier_invoices_list(
         .await
         .map_err(|e| Json(ApiError::from(e.to_string())).into_response())?
     {
-        out.push(SupplierInvoiceDto {
-            id: docu
-                .get_str("id")
-                .or_else(|_| docu.get_str("_id"))
-                .unwrap_or_default()
-                .to_string(),
-            supplier_id: docu
-                .get_str("supplier_id")
-                .unwrap_or_default()
-                .to_string(),
-            invoice_id: opt_string(&docu, "invoice_id"),
-            amount: f64_from(&docu, "amount"),
-            created_at: opt_string(&docu, "created_at"),
-        });
+out.push(SupplierInvoiceDto {
+    id: docu.get_str("id").or_else(|_| docu.get_str("_id")).unwrap_or_default().to_string(),
+    supplier_id: docu.get_str("supplier_id").unwrap_or_default().to_string(),
+    invoice_id: opt_string(&docu, "invoice_id"),
+    amount: f64_from(&docu, "amount"),
+    created_at: opt_string(&docu, "created_at"),
+
+    // ✅ الجديد
+    note: opt_string(&docu, "note"),
+    image_text: opt_string(&docu, "image_text"),
+});
+
     }
 
     Ok(Json(out))
@@ -2770,26 +2782,36 @@ async fn supplier_invoice_add(
         .clone()
         .unwrap_or_else(now_iso_rfc3339);
 
-    let docu = doc! {
-        "_id": &id,
-        "id": &id,
-        "supplier_id": &req.supplier_id,
-        "invoice_id": req.invoice_id.clone().map(Bson::String).unwrap_or(Bson::Null),
-        "amount": req.amount,
-        "created_at": &created_at,
-    };
+let docu = doc! {
+    "_id": &id,
+    "id": &id,
+    "supplier_id": &req.supplier_id,
+    "invoice_id": req.invoice_id.clone().map(Bson::String).unwrap_or(Bson::Null),
+    "amount": req.amount,
+    "created_at": &created_at,
+
+    // ✅ الجديد
+    "note": req.note.clone().map(Bson::String).unwrap_or(Bson::Null),
+    "image_text": req.image_text.clone().map(Bson::String).unwrap_or(Bson::Null),
+};
+
 
     coll.insert_one(docu, None)
         .await
         .map_err(|e| Json(ApiError::from(e.to_string())).into_response())?;
 
-    Ok(Json(SupplierInvoiceDto {
-        id,
-        supplier_id: req.supplier_id,
-        invoice_id: req.invoice_id,
-        amount: req.amount,
-        created_at: Some(created_at),
-    }))
+Ok(Json(SupplierInvoiceDto {
+    id,
+    supplier_id: req.supplier_id,
+    invoice_id: req.invoice_id,
+    amount: req.amount,
+    created_at: Some(created_at),
+
+    // ✅ الجديد
+    note: req.note,
+    image_text: req.image_text,
+}))
+
 }
 
 async fn supplier_invoice_update(
@@ -2809,6 +2831,13 @@ async fn supplier_invoice_update(
     if let Some(v) = req.amount {
         set_doc.insert("amount", v);
     }
+    if let Some(v) = req.note {
+    set_doc.insert("note", v);
+}
+if let Some(v) = req.image_text {
+    set_doc.insert("image_text", v);
+}
+
     if let Some(v) = req.created_at {
         set_doc.insert("created_at", v);
     }
@@ -2929,7 +2958,9 @@ let app = public
     .merge(protected)
     .with_state(ctx.clone())
     .layer(cors)
+    .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // ✅ 10MB
     .layer(TraceLayer::new_for_http());
+
 
 
 let port: u16 = std::env::var("PORT")
