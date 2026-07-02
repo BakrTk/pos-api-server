@@ -2876,100 +2876,104 @@ pub async fn run_http_server() -> anyhow::Result<()> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
+
+    // يتجاهل الخطأ إذا كانت tracing مهيّأة مسبقًا أثناء الاختبارات.
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    let api_key = std::env::var("POS_API_KEY").unwrap_or_else(|_| "SUPER_SECRET_API_KEY_123".into());
-    let hmac_secret =
-        std::env::var("POS_HMAC_SECRET").unwrap_or_else(|_| "dev-secret-xyz".into());
+    let api_key = std::env::var("POS_API_KEY")
+        .map_err(|_| anyhow::anyhow!("POS_API_KEY missing in environment"))?;
 
-    println!("[boot] POS_API_KEY = {}", api_key);
+    let hmac_secret = std::env::var("POS_HMAC_SECRET")
+        .map_err(|_| anyhow::anyhow!("POS_HMAC_SECRET missing in environment"))?;
+
+    // لا تطبع المفتاح نفسه في logs.
+    println!("[boot] POS_API_KEY loaded");
 
     let ctx = Arc::new(ApiCtx {
         api_key,
         hmac_secret,
     });
 
-let cors = CorsLayer::new()
-    .allow_origin(Any)
-    .allow_methods(Any)
-    .allow_headers(Any);
+    // CORS مؤقتًا: السماح لجميع المواقع والـ methods والـ headers.
+    // أزل هذا لاحقًا واستبدل Any بالدومين المسموح فقط.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
-let public = Router::new()
-    .route("/api/health", get(health))
-    .route("/api/login", post(login));
+    // المسارات العامة لا تحتاج x-api-key.
+    let public = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/login", post(login));
 
-let protected = Router::new()
-    // admins
-    .route("/api/admins", get(admins_list).post(admin_add))
-    .route("/api/admins/:id", put(admin_update).delete(admin_delete))
+    // هذه المسارات تتطلب x-api-key، بينما OPTIONS يتم تجاوزه داخل auth_mw.
+    let protected = Router::new()
+        // admins
+        .route("/api/admins", get(admins_list).post(admin_add))
+        .route("/api/admins/:id", put(admin_update).delete(admin_delete))
+        // users
+        .route("/api/users", get(users_list).post(user_add))
+        .route("/api/users/:id", put(user_update).delete(user_delete))
+        // categories
+        .route("/api/categories", get(categories_list).post(category_add))
+        .route("/api/categories/:id", put(category_update).delete(category_delete))
+        // items
+        .route("/api/items", get(items_list).post(item_add))
+        .route("/api/items/:id", put(item_update).delete(item_delete))
+        // tables
+        .route("/api/tables", get(tables_list).post(table_add))
+        .route("/api/tables/:id", put(table_update).delete(table_delete))
+        // invoices core
+        .route("/api/invoices", get(invoices_list))
+        .route("/api/invoice/open", post(invoice_open))
+        .route("/api/invoice/move", post(invoice_move))
+        .route("/api/invoice/:id", get(invoice_get))
+        .route("/api/invoice/:id/details", get(invoice_details))
+        .route("/api/invoice/:id/add", post(invoice_add_or_inc))
+        .route("/api/invoice/:id/dec", post(invoice_decrement_or_remove))
+        .route("/api/invoice/:id/pay", post(invoice_pay_and_close))
+        .route("/api/invoice/:id/void", post(invoice_close_void))
+        .route("/api/invoice/:id/print", post(invoice_print))
+        // ledger products (movements)
+        .route("/api/products", get(products_list).post(product_add))
+        .route("/api/products/:id", put(product_update).delete(product_delete))
+        // box
+        .route("/api/box", get(box_list).post(box_add))
+        .route("/api/box/:id", put(box_update).delete(box_delete))
+        // profits
+        .route("/api/profits", get(profits_list).post(profit_add))
+        .route("/api/profits/:id", put(profit_update).delete(profit_delete))
+        // suppliers
+        .route("/api/suppliers", get(suppliers_list).post(supplier_add))
+        .route("/api/suppliers/:id", put(supplier_update).delete(supplier_delete))
+        // supplier invoices
+        .route(
+            "/api/supplier_invoices",
+            get(supplier_invoices_list).post(supplier_invoice_add),
+        )
+        .route(
+            "/api/supplier_invoices/:id",
+            put(supplier_invoice_update).delete(supplier_invoice_delete),
+        )
+        .layer(from_fn_with_state(ctx.clone(), auth_mw));
 
-    // users
-    .route("/api/users", get(users_list).post(user_add))
-    .route("/api/users/:id", put(user_update).delete(user_delete))
+    let app = public
+        .merge(protected)
+        .with_state(ctx)
+        // يجب أن يكون CORS خارج auth_mw كي يتعامل مع OPTIONS preflight.
+        .layer(cors)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(TraceLayer::new_for_http());
 
-    // categories
-    .route("/api/categories", get(categories_list).post(category_add))
-    .route("/api/categories/:id", put(category_update).delete(category_delete))
+    // Render يمرر PORT تلقائيًا. محليًا سيستخدم 8080.
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(8080);
 
-    // items
-    .route("/api/items", get(items_list).post(item_add))
-    .route("/api/items/:id", put(item_update).delete(item_delete))
-
-    // tables
-    .route("/api/tables", get(tables_list).post(table_add))
-    .route("/api/tables/:id", put(table_update).delete(table_delete))
-
-    // invoices core
-    .route("/api/invoices", get(invoices_list))
-    .route("/api/invoice/open", post(invoice_open))
-    .route("/api/invoice/move", post(invoice_move))
-    .route("/api/invoice/:id", get(invoice_get))
-    .route("/api/invoice/:id/details", get(invoice_details))
-    .route("/api/invoice/:id/add", post(invoice_add_or_inc))
-    .route("/api/invoice/:id/dec", post(invoice_decrement_or_remove))
-    .route("/api/invoice/:id/pay", post(invoice_pay_and_close))
-    .route("/api/invoice/:id/void", post(invoice_close_void))
-    .route("/api/invoice/:id/print", post(invoice_print))
-
-    // ledger products (movements)
-    .route("/api/products", get(products_list).post(product_add))
-    .route("/api/products/:id", put(product_update).delete(product_delete))
-
-    // box
-    .route("/api/box", get(box_list).post(box_add))
-    .route("/api/box/:id", put(box_update).delete(box_delete))
-
-    // profits
-    .route("/api/profits", get(profits_list).post(profit_add))
-    .route("/api/profits/:id", put(profit_update).delete(profit_delete))
-
-    // suppliers
-    .route("/api/suppliers", get(suppliers_list).post(supplier_add))
-    .route("/api/suppliers/:id", put(supplier_update).delete(supplier_delete))
-
-    // supplier invoices
-    .route("/api/supplier_invoices", get(supplier_invoices_list).post(supplier_invoice_add))
-    .route("/api/supplier_invoices/:id", put(supplier_invoice_update).delete(supplier_invoice_delete))
-
-    // ✅ طبّق auth_mw فقط هنا
-    .layer(from_fn_with_state(ctx.clone(), auth_mw));
-
-let app = public
-    .merge(protected)
-    .with_state(ctx.clone())
-    .layer(cors)
-    .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // ✅ 10MB
-    .layer(TraceLayer::new_for_http());
-
-
-
-let port: u16 = std::env::var("PORT")
-    .ok()
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(3000);
-
-let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
     tracing::info!(target: "http", "[http] listening on http://{addr}");
 
     axum::serve(listener, app).await?;
